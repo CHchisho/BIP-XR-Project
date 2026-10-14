@@ -133,3 +133,6 @@ Thumbs.db
 Thumbs.db.meta
 ehthumbs.db
 desktop.ini
+
+# Unity test output
+TestResults/

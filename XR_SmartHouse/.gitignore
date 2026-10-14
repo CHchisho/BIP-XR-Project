@@ -1,0 +1,4 @@
+# Secrets: Home Assistant login and token
+.env
+ha_token.txt
+ha_token.txt.meta
