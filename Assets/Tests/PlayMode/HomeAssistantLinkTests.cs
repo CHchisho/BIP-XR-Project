@@ -64,6 +64,41 @@ namespace SmartHouse.Tests
         }
 
         [UnityTest]
+        public IEnumerator Light_RemoteColor_IsShownInVR_WithoutEcho()
+        {
+            Server.SetState("light.test", "on", ("brightness", "255"), ("rgbw_color", "[0,0,255,0]"));
+            var (lamp, _) = CreateLinkedDevice<LampDevice, HomeAssistantToggleLink>(("entityId", "light.test"));
+            Set(lamp, "colorControl", true);
+
+            yield return WaitUntil(() => !lamp.IsWhite, "the lamp to turn blue from Home Assistant");
+            Assert.AreEqual(1f, lamp.Color.b, 0.01f);
+            StringAssert.Contains("Blue", lamp.Status);
+            yield return Wait(0.5f);
+            Assert.IsEmpty(Server.ServiceCalls, "a color that came from Home Assistant must not be sent back");
+
+            Server.SetState("light.test", "on", ("brightness", "255"), ("rgbw_color", "[0,0,0,255]"));
+            yield return WaitUntil(() => lamp.IsWhite, "the lamp to turn white again");
+        }
+
+        [UnityTest]
+        public IEnumerator Light_ChangingColorInVR_SendsRgbwColor()
+        {
+            Server.SetState("light.test", "on", ("brightness", "255"), ("rgbw_color", "[0,0,0,255]"));
+            var (lamp, _) = CreateLinkedDevice<LampDevice, HomeAssistantToggleLink>(("entityId", "light.test"));
+            Set(lamp, "colorControl", true);
+            yield return WaitUntil(() => lamp.IsOn, "the lamp to switch on from Home Assistant");
+
+            for (int i = 0; i < 4; i++) lamp.AdjustColor(0.05f); // a twist off the white band into red
+
+            yield return WaitUntil(() => Server.ServiceCalls.Count >= 1, "the color call");
+            yield return Wait(0.4f);
+            var call = Server.ServiceCalls.Single();
+            Assert.AreEqual("/api/services/light/turn_on", call.Path);
+            StringAssert.Contains("\"rgbw_color\":[255,", call.Body);
+            Assert.IsFalse(lamp.IsWhite);
+        }
+
+        [UnityTest]
         public IEnumerator Light_DimmerSwitch_DimsItsLamp()
         {
             Server.SetState("light.test", "on", ("brightness", "255"));
@@ -80,6 +115,27 @@ namespace SmartHouse.Tests
             yield return WaitUntil(() => Server.ServiceCalls.Count >= 1, "the brightness call");
             Assert.AreEqual(40, MockHomeAssistant.NumberField(Server.ServiceCalls.Last().Body, "brightness_pct"));
             StringAssert.Contains("40%", dimmer.Status);
+        }
+
+        [UnityTest]
+        public IEnumerator Light_WallSwitch_DimsAndColorsItsLamp()
+        {
+            Server.SetState("light.test", "on", ("brightness", "255"), ("rgbw_color", "[0,0,0,255]"));
+            var (lamp, _) = CreateLinkedDevice<LampDevice, HomeAssistantToggleLink>(("entityId", "light.test"));
+            Set(lamp, "colorControl", true);
+            var switchGo = Track(new UnityEngine.GameObject("Light Switch (test)"));
+            switchGo.SetActive(false);
+            var wallSwitch = switchGo.AddComponent<LightSwitchDevice>();
+            Set(wallSwitch, "lamp", lamp);
+            switchGo.SetActive(true);
+            yield return WaitUntil(() => lamp.IsOn, "the lamp to switch on from Home Assistant");
+
+            Assert.AreSame(lamp, wallSwitch.ColorTarget, "grip + twist at the switch should color its lamp");
+            wallSwitch.Adjust(-0.6f);
+
+            yield return WaitUntil(() => Server.ServiceCalls.Count >= 1, "the brightness call");
+            Assert.AreEqual(40, MockHomeAssistant.NumberField(Server.ServiceCalls.Last().Body, "brightness_pct"));
+            StringAssert.Contains("40%", wallSwitch.Status);
         }
 
         [UnityTest]
@@ -227,6 +283,98 @@ namespace SmartHouse.Tests
             Assert.AreEqual("/api/services/climate/set_hvac_mode", call.Path);
             Assert.AreEqual("off", MockHomeAssistant.StringField(call.Body, "hvac_mode"));
             Assert.AreEqual("off", Server.GetStateOf("climate.test"));
+        }
+
+        // ---- Speaker (HomeAssistantSpeakerLink + SpeakerDevice) ---------------------------------------
+
+        const string Popular = "media-source://radio_browser/popular";
+        const string Bbc = "media-source://radio_browser/98adecf7-2683-4408-9be7-02d3f9098eb8";
+
+        void SetPopularStations() => Server.SetBrowseFolder(Popular,
+            ("Popular stations", "media-source://radio_browser/folder", "", false),
+            ("Some AAC Station", "media-source://radio_browser/11111111-1111-1111-1111-111111111111", "audio/aac", true),
+            ("BBC World Service", Bbc, "audio/mpeg", true));
+
+        [UnityTest]
+        public IEnumerator Speaker_Pressing_BrowsesPopularAndPlaysTheStation()
+        {
+            Server.SetState("media_player.test", "off");
+            SetPopularStations();
+            var (speaker, link) = CreateLinkedDevice<SpeakerDevice, HomeAssistantSpeakerLink>(("entityId", "media_player.test"));
+            yield return WaitUntil(() => link.Available, "the first poll");
+
+            speaker.Press();
+
+            yield return WaitUntil(() => Server.ServiceCalls.Count == 1, "play_media");
+            var call = Server.ServiceCalls[0];
+            Assert.AreEqual("/api/services/media_player/play_media", call.Path);
+            Assert.AreEqual("media_player.test", MockHomeAssistant.StringField(call.Body, "entity_id"));
+            Assert.AreEqual(Bbc, MockHomeAssistant.StringField(call.Body, "media_content_id"));
+            Assert.AreEqual("audio/mpeg", MockHomeAssistant.StringField(call.Body, "media_content_type"));
+            Assert.AreEqual("playing", Server.GetStateOf("media_player.test"));
+
+            var browse = Server.Requests.Single(r => r.Method == "WS");
+            Assert.AreEqual(Popular, MockHomeAssistant.StringField(browse.Body, "media_content_id"));
+            Assert.AreEqual("music", MockHomeAssistant.StringField(browse.Body, "media_content_type"));
+
+            yield return Wait(0.6f); // past the settle time: the poll now reads "playing" and keeps it
+            Assert.IsTrue(speaker.IsPlaying);
+            Assert.AreEqual(1, Server.ServiceCalls.Count, "nothing echoed back");
+        }
+
+        [UnityTest]
+        public IEnumerator Speaker_PressingWhilePlaying_SendsTurnOff()
+        {
+            Server.SetState("media_player.test", "playing", ("volume_level", "0.3"));
+            var (speaker, _) = CreateLinkedDevice<SpeakerDevice, HomeAssistantSpeakerLink>(("entityId", "media_player.test"));
+            yield return WaitUntil(() => speaker.IsPlaying, "the playing state from Home Assistant");
+            Assert.AreEqual(0.3f, speaker.Volume, 0.001f);
+
+            speaker.Press();
+
+            yield return WaitUntil(() => Server.ServiceCalls.Count == 1, "turn_off");
+            Assert.AreEqual("/api/services/media_player/turn_off", Server.ServiceCalls[0].Path);
+            Assert.AreEqual("off", Server.GetStateOf("media_player.test"));
+            Assert.IsFalse(Server.Requests.Any(r => r.Method == "WS"), "no browse needed to stop");
+        }
+
+        [UnityTest]
+        public IEnumerator Speaker_Dragging_SendsOneVolumeSet()
+        {
+            Server.SetState("media_player.test", "playing", ("volume_level", "0.2"));
+            var (speaker, _) = CreateLinkedDevice<SpeakerDevice, HomeAssistantSpeakerLink>(
+                ("entityId", "media_player.test"), ("volumeDebounce", 0.15f));
+            yield return WaitUntil(() => UnityEngine.Mathf.Approximately(speaker.Volume, 0.2f), "the volume from Home Assistant");
+
+            speaker.Adjust(0.1f);
+            speaker.Adjust(0.1f);
+
+            yield return WaitUntil(() => Server.ServiceCalls.Count >= 1, "volume_set");
+            yield return Wait(0.4f);
+            var call = Server.ServiceCalls.Single();
+            Assert.AreEqual("/api/services/media_player/volume_set", call.Path);
+            Assert.AreEqual(0.4, MockHomeAssistant.NumberField(call.Body, "volume_level"), 0.001);
+        }
+
+        [UnityTest]
+        public IEnumerator Speaker_Unavailable_GetsNoCommand_AndPlaysLocally()
+        {
+            Server.SetState("media_player.test", "unavailable");
+            SetPopularStations();
+            var (speaker, link) = CreateLinkedDevice<SpeakerDevice, HomeAssistantSpeakerLink>(("entityId", "media_player.test"));
+            yield return WaitUntil(() => Server.WasRead("media_player.test"), "the first poll");
+            yield return Wait(0.2f);
+            Assert.IsFalse(link.Available);
+
+            UnityEngine.TestTools.LogAssert.Expect(UnityEngine.LogType.Warning,
+                new System.Text.RegularExpressions.Regex("media_player.test is unavailable"));
+            speaker.Press();
+            yield return Wait(0.4f);
+
+            Assert.IsEmpty(Server.ServiceCalls);
+            Assert.IsTrue(speaker.IsPlaying);
+            var source = speaker.GetComponentInChildren<UnityEngine.AudioSource>();
+            Assert.IsTrue(source.isPlaying, "the VR model plays its own track when the real speaker can't");
         }
     }
 }

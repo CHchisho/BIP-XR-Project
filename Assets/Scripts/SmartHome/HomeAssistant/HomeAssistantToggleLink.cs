@@ -9,6 +9,7 @@ namespace SmartHouse.HomeAssistant
     /// toggling it in VR switches the real device, and switching the real device (wall switch, HA app)
     /// updates it in VR on the next poll. For dimmable lamps the brightness is mirrored both ways
     /// (dimming in VR sends brightness_pct once the drag settles), and an optional power sensor is shown.
+    /// For a color lamp (<see cref="IColorDevice"/>) on an RGBW light the color is mirrored the same way, as rgbw_color.
     /// </summary>
     [RequireComponent(typeof(SmartDevice))]
     public class HomeAssistantToggleLink : MonoBehaviour
@@ -56,9 +57,19 @@ namespace SmartHouse.HomeAssistant
 
         bool lastSentOn;
         float lastSentBrightness = -1f;
+        string lastSentColor;
         float sendBrightnessAt = -1f;
 
         IDimmableDevice Dimmable => device as IDimmableDevice;
+        IColorDevice Colored => device is IColorDevice c && c.SupportsColor && Domain == "light" ? c : null;
+
+        /// <summary>The lamp's color as Home Assistant's rgbw_color: plain white is the white channel alone.</summary>
+        static string RgbwJson(IColorDevice lamp)
+        {
+            if (lamp.IsWhite) return "[0,0,0,255]";
+            Color c = lamp.Color;
+            return $"[{Mathf.RoundToInt(c.r * 255f)},{Mathf.RoundToInt(c.g * 255f)},{Mathf.RoundToInt(c.b * 255f)},0]";
+        }
 
         void OnDeviceChanged(SmartDevice _)
         {
@@ -66,8 +77,10 @@ namespace SmartHouse.HomeAssistant
 
             if (device.IsOn == lastSentOn)
             {
-                // Only the brightness (or the power reading) changed: send brightness after the drag settles.
-                if (device.IsOn && Dimmable != null && Mathf.Abs(Dimmable.Brightness - lastSentBrightness) > 0.005f)
+                // Only the brightness or color (or the power reading) changed: send it after the drag settles.
+                bool dimmed = Dimmable != null && Mathf.Abs(Dimmable.Brightness - lastSentBrightness) > 0.005f;
+                bool recolored = Colored != null && RgbwJson(Colored) != lastSentColor;
+                if (device.IsOn && (dimmed || recolored))
                 {
                     sendBrightnessAt = Time.unscaledTime + brightnessDebounce;
                     ignorePollUntil = sendBrightnessAt + commandSettleTime;
@@ -103,6 +116,11 @@ namespace SmartHouse.HomeAssistant
             {
                 lastSentBrightness = Dimmable.Brightness;
                 extra = "\"brightness_pct\":" + Mathf.Clamp(Mathf.RoundToInt(lastSentBrightness * 100f), 1, 100);
+                if (Colored != null)
+                {
+                    lastSentColor = RgbwJson(Colored);
+                    extra += ",\"rgbw_color\":" + lastSentColor;
+                }
             }
             StartCoroutine(client.CallService(Domain, device.IsOn ? "turn_on" : "turn_off", entityId, ok =>
             {
@@ -113,6 +131,7 @@ namespace SmartHouse.HomeAssistant
         IEnumerator PollLoop()
         {
             lastSentOn = device.IsOn;
+            if (Colored != null) lastSentColor = RgbwJson(Colored);
             var wait = new WaitForSecondsRealtime(pollInterval);
             while (true)
             {
@@ -144,10 +163,22 @@ namespace SmartHouse.HomeAssistant
                     Dimmable.SetBrightness(s.attributes.brightness / 255f);
                     lastSentBrightness = Dimmable.Brightness;
                 }
+                if (on && Colored != null && s.attributes?.rgbw_color != null && s.attributes.rgbw_color.Length == 4)
+                {
+                    ApplyColor(Colored, s.attributes.rgbw_color);
+                    lastSentColor = RgbwJson(Colored);
+                }
                 if (on != device.IsOn) device.SetOn(on);
             }
             finally { applyingRemote = false; }
             lastSentOn = device.IsOn;
+        }
+
+        static void ApplyColor(IColorDevice lamp, int[] rgbw)
+        {
+            int maxRgb = Mathf.Max(rgbw[0], Mathf.Max(rgbw[1], rgbw[2]));
+            if (maxRgb == 0 || rgbw[3] >= maxRgb) lamp.SetWhite(); // the white channel dominates: plain white
+            else lamp.SetColor(new Color(rgbw[0] / 255f, rgbw[1] / 255f, rgbw[2] / 255f));
         }
 
         void ApplyPower(HomeAssistantClient.EntityState s)

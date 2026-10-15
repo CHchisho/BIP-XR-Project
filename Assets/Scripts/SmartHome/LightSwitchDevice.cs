@@ -2,8 +2,11 @@ using UnityEngine;
 
 namespace SmartHouse
 {
-    /// <summary>Wall switch that toggles a lamp and tilts its rocker.</summary>
-    public class LightSwitchDevice : SmartDevice
+    /// <summary>
+    /// Wall switch that toggles a lamp and tilts its rocker. Twisting at it (trigger or grip) dims the lamp,
+    /// and grip + twist changes the color of a color lamp, the same as at the lamp itself.
+    /// </summary>
+    public class LightSwitchDevice : SmartDevice, IAdjustable
     {
         [SerializeField] LampDevice lamp;
         [SerializeField] Transform rocker;
@@ -12,7 +15,7 @@ namespace SmartHouse
         AudioSource audioSource;
         Quaternion rockerRest;
 
-        public override string Status => IsActive ? "Light on" : "Light off";
+        public override string Status => lamp == null ? "Not connected" : "Light " + lamp.Status.ToLowerInvariant();
         public override bool IsActive => lamp != null && lamp.IsOn;
         public override bool ShowPopups => false; // the lamp itself pops up
         public override SmartDevice ControlledDevice => lamp;
@@ -38,6 +41,11 @@ namespace SmartHouse
         {
             audioSource.Play();
             if (lamp != null) lamp.SetOn(!lamp.IsOn);
+        }
+
+        public void Adjust(float amount)
+        {
+            if (lamp != null) lamp.Adjust(amount);
         }
 
         void UpdateRocker()

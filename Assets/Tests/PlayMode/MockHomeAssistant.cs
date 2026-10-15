@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -13,7 +15,9 @@ namespace SmartHouse.Tests
 {
     /// <summary>
     /// A small in-process stand-in for the Home Assistant REST API (ha-api-v2.md), on 127.0.0.1:
-    /// GET /api/ and /api/states/{entity_id}, POST /api/services/{domain}/{service}.
+    /// GET /api/ and /api/states/{entity_id}, POST /api/services/{domain}/{service}, and the
+    /// WebSocket API with auth and media_player/browse_media (ha-api-speaker.md). Mono's HttpListener can't
+    /// accept WebSockets, so that is served on a second port: <see cref="WebSocketUrl"/>.
     /// It checks the bearer token, records every request, and applies service calls to its
     /// entity states the way the real devices would, so the app's polling sees the result.
     /// </summary>
@@ -41,8 +45,13 @@ namespace SmartHouse.Tests
         readonly object gate = new object();
         readonly Dictionary<string, Entity> entities = new Dictionary<string, Entity>();
         readonly List<Request> requests = new List<Request>();
+        readonly Dictionary<string, string> browseFolders = new Dictionary<string, string>(); // media_content_id -> children JSON
+
+        readonly TcpListener wsListener;
+        readonly Thread wsThread;
 
         public string Url { get; }
+        public string WebSocketUrl { get; }
 
         public MockHomeAssistant()
         {
@@ -56,6 +65,12 @@ namespace SmartHouse.Tests
             listener.Start();
             thread = new Thread(Serve) { IsBackground = true, Name = "MockHomeAssistant" };
             thread.Start();
+
+            wsListener = new TcpListener(IPAddress.Loopback, 0);
+            wsListener.Start();
+            WebSocketUrl = $"ws://127.0.0.1:{((IPEndPoint)wsListener.LocalEndpoint).Port}/api/websocket";
+            wsThread = new Thread(ServeWebSockets) { IsBackground = true, Name = "MockHomeAssistant WebSocket" };
+            wsThread.Start();
         }
 
         /// <summary>Sets an entity; attributes are given as raw JSON values, e.g. ("brightness", "128").</summary>
@@ -67,6 +82,20 @@ namespace SmartHouse.Tests
                 foreach (var (name, json) in attributes) e.Attributes[name] = json;
                 entities[entityId] = e;
             }
+        }
+
+        /// <summary>What browse_media returns for a folder: (title, media_content_id, media_content_type, can_play).</summary>
+        public void SetBrowseFolder(string mediaContentId, params (string title, string id, string type, bool canPlay)[] children)
+        {
+            var json = string.Join(",", children.Select(c =>
+                $"{{\"title\":\"{c.title}\",\"media_content_id\":\"{c.id}\",\"media_content_type\":\"{c.type}\",\"can_play\":{(c.canPlay ? "true" : "false")}}}"));
+            lock (gate) browseFolders[mediaContentId] = "[" + json + "]";
+        }
+
+        /// <summary>Raw JSON value of an entity attribute, or null.</summary>
+        public string GetAttributeOf(string entityId, string name)
+        {
+            lock (gate) return entities.TryGetValue(entityId, out var e) && e.Attributes.TryGetValue(name, out var v) ? v : null;
         }
 
         public string GetStateOf(string entityId)
@@ -98,6 +127,7 @@ namespace SmartHouse.Tests
         void Handle(HttpListenerContext context)
         {
             var req = context.Request;
+
             string body;
             using (var reader = new StreamReader(req.InputStream, Encoding.UTF8)) body = reader.ReadToEnd();
             var record = new Request
@@ -155,6 +185,8 @@ namespace SmartHouse.Tests
                     var pct = NumberField(body, "brightness_pct");
                     if (pct != null) e.Attributes["brightness"] = Mathf255(pct.Value);
                     else if (!e.Attributes.ContainsKey("brightness") || e.Attributes["brightness"] == "null") e.Attributes["brightness"] = "255";
+                    var rgbw = Regex.Match(body, "\"rgbw_color\"\\s*:\\s*(\\[[^\\]]*\\])");
+                    if (rgbw.Success) e.Attributes["rgbw_color"] = rgbw.Groups[1].Value;
                     break;
                 case "light.turn_off":
                     e.State = "off";
@@ -166,12 +198,114 @@ namespace SmartHouse.Tests
                 case "cover.close_cover": e.State = "closed"; e.Attributes["current_position"] = "0"; break;
                 case "lock.lock": e.State = "locked"; break;
                 case "lock.unlock": e.State = "unlocked"; break;
+                case "media_player.turn_on": e.State = "idle"; break;
+                case "media_player.turn_off": e.State = "off"; break;
+                case "media_player.volume_set":
+                    var v = NumberField(body, "volume_level");
+                    if (v != null) e.Attributes["volume_level"] = v.Value.ToString(CultureInfo.InvariantCulture);
+                    break;
+                case "media_player.play_media":
+                    e.State = "playing";
+                    e.Attributes["media_content_id"] = "\"" + StringField(body, "media_content_id") + "\"";
+                    break;
                 case "climate.set_hvac_mode": e.State = StringField(body, "hvac_mode") ?? e.State; break;
                 case "climate.set_temperature":
                     var t = NumberField(body, "temperature");
                     if (t != null) e.Attributes["temperature"] = t.Value.ToString(CultureInfo.InvariantCulture);
                     break;
             }
+        }
+
+        /// <summary>The Home Assistant WebSocket handshake plus media_player/browse_media; recorded as Method "WS".</summary>
+        void ServeWebSockets()
+        {
+            while (true)
+            {
+                TcpClient tcp;
+                try { tcp = wsListener.AcceptTcpClient(); }
+                catch (Exception) { return; } // listener stopped
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try { using (tcp) HandleWebSocket(Upgrade(tcp.GetStream())); }
+                    catch (Exception) { /* client went away */ }
+                });
+            }
+        }
+
+        /// <summary>Answers the HTTP upgrade request (RFC 6455) and wraps the stream as a server WebSocket.</summary>
+        static WebSocket Upgrade(NetworkStream stream)
+        {
+            var header = new StringBuilder();
+            while (!header.ToString().EndsWith("\r\n\r\n"))
+            {
+                int b = stream.ReadByte();
+                if (b < 0) throw new IOException("closed during handshake");
+                header.Append((char)b);
+            }
+            var key = Regex.Match(header.ToString(), @"Sec-WebSocket-Key:\s*(\S+)", RegexOptions.IgnoreCase).Groups[1].Value;
+            string accept;
+            using (var sha1 = SHA1.Create())
+                accept = Convert.ToBase64String(sha1.ComputeHash(Encoding.ASCII.GetBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+            var reply = Encoding.ASCII.GetBytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+                                                $"Sec-WebSocket-Accept: {accept}\r\n\r\n");
+            stream.Write(reply, 0, reply.Length);
+            return WebSocket.CreateFromStream(stream, true, null, TimeSpan.FromSeconds(30));
+        }
+
+        void HandleWebSocket(WebSocket ws)
+        {
+            try
+            {
+                WsSend(ws, "{\"type\":\"auth_required\"}");
+                var auth = WsReceive(ws);
+                if (StringField(auth, "access_token") != Token)
+                {
+                    WsSend(ws, "{\"type\":\"auth_invalid\",\"message\":\"Invalid access token\"}");
+                    return;
+                }
+                WsSend(ws, "{\"type\":\"auth_ok\"}");
+
+                while (ws.State == WebSocketState.Open)
+                {
+                    var msg = WsReceive(ws);
+                    if (msg == null) return;
+                    lock (gate) requests.Add(new Request { Method = "WS", Path = "/api/websocket", Body = msg });
+                    int id = (int)(NumberField(msg, "id") ?? 0);
+                    string children = null;
+                    if (StringField(msg, "type") == "media_player/browse_media")
+                        lock (gate) browseFolders.TryGetValue(StringField(msg, "media_content_id") ?? "", out children);
+                    WsSend(ws, children != null
+                        ? $"{{\"id\":{id},\"type\":\"result\",\"success\":true,\"result\":{{\"title\":\"Popular\",\"children\":{children}}}}}"
+                        : $"{{\"id\":{id},\"type\":\"result\",\"success\":false,\"error\":{{\"code\":\"not_found\",\"message\":\"Unknown folder\"}}}}");
+                }
+            }
+            finally
+            {
+                try
+                {
+                    if (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseReceived)
+                        ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None).Wait(1000);
+                }
+                catch (Exception) { }
+                ws.Dispose();
+            }
+        }
+
+        static void WsSend(WebSocket ws, string json) =>
+            ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json)), WebSocketMessageType.Text, true, CancellationToken.None).Wait();
+
+        static string WsReceive(WebSocket ws)
+        {
+            var buffer = new byte[16384];
+            var text = new StringBuilder();
+            WebSocketReceiveResult result;
+            do
+            {
+                result = ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None).GetAwaiter().GetResult();
+                if (result.MessageType == WebSocketMessageType.Close) return null;
+                text.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+            } while (!result.EndOfMessage);
+            return text.ToString();
         }
 
         static string Mathf255(double pct) => ((int)Math.Round(pct * 255.0 / 100.0)).ToString(CultureInfo.InvariantCulture);
@@ -207,7 +341,9 @@ namespace SmartHouse.Tests
         public void Dispose()
         {
             try { listener.Stop(); listener.Close(); } catch (ObjectDisposedException) { }
+            wsListener.Stop();
             thread.Join(1000);
+            wsThread.Join(1000);
         }
     }
 }

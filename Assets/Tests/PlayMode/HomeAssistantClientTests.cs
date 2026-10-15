@@ -98,7 +98,7 @@ namespace SmartHouse.Tests
 
         [UnityTest]
         public IEnumerator CallService_AllowsEveryApprovedDomain(
-            [Values("light", "switch", "cover", "lock", "climate")] string domain)
+            [Values("light", "switch", "cover", "lock", "climate", "media_player")] string domain)
         {
             bool? ok = null;
             yield return Client.CallService(domain, "noop", domain + ".test", r => ok = r);

@@ -14,7 +14,7 @@ namespace SmartHouse
     /// </summary>
     public class UiPanelDiagnostics : MonoBehaviour
     {
-        public static bool Enabled = true;
+        public static bool Enabled = false;
         const float Interval = 3f;
 
         string path;

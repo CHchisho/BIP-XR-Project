@@ -44,7 +44,7 @@ namespace SmartHouse.Tests
             var go = Track(new GameObject("Home Assistant Client (test)"));
             go.SetActive(false);
             var client = go.AddComponent<HomeAssistantClient>();
-            client.Configure(Server.Url, token);
+            client.Configure(Server.Url, token, Server.WebSocketUrl);
             go.SetActive(true);
             return client;
         }

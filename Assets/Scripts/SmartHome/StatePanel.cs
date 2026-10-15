@@ -56,6 +56,7 @@ namespace SmartHouse
             interactable.hoverEntered.AddListener(OnHoverEntered);
             interactable.hoverExited.AddListener(OnHoverExited);
             interactable.selectEntered.AddListener(OnSelected);
+            interactable.selectExited.AddListener(OnDeselected);
         }
 
         void OnDisable()
@@ -63,6 +64,7 @@ namespace SmartHouse
             interactable.hoverEntered.RemoveListener(OnHoverEntered);
             interactable.hoverExited.RemoveListener(OnHoverExited);
             interactable.selectEntered.RemoveListener(OnSelected);
+            interactable.selectExited.RemoveListener(OnDeselected);
         }
 
         void Start()
@@ -105,9 +107,15 @@ namespace SmartHouse
             if (deviceFeedback != null) deviceFeedback.SetHighlighted((this, args.interactorObject), false);
         }
 
+        // Grabbing the panel is grabbing the device: press, or hold and move / twist to adjust it.
         void OnSelected(SelectEnterEventArgs args)
         {
-            if (device != null) device.Press();
+            if (device != null) device.BeginGrab(args.interactorObject.transform);
+        }
+
+        void OnDeselected(SelectExitEventArgs args)
+        {
+            if (device != null) device.EndGrab(args.interactorObject.transform);
         }
 
         void UpdateGlow()
@@ -162,9 +170,13 @@ namespace SmartHouse
             state.fontSizeMin = 18f * k;
             state.fontSizeMax = 40f * k;
 
-            string hint = device is IAdjustable ? "Trigger: switch  ·  hold + move hand: adjust" : "Point and pull the trigger";
-            NewText(root, "Hint", hint, 11f * k, FontStyles.Normal, UiTheme.TextDim,
+            string hint = device is IAdjustable ? "Trigger: switch  ·  hold + twist wrist: adjust" : "Point and pull the trigger";
+            if (device != null && device.ColorTarget != null) hint += "  ·  grip + twist: color";
+            var hintText = NewText(root, "Hint", hint, 11f * k, FontStyles.Normal, UiTheme.TextDim,
                 new Vector2(pad, -(h - pad - 16f * k)), new Vector2(w - 2f * pad, 16f * k));
+            hintText.enableAutoSizing = true; // the color lamp's longer hint shrinks to fit
+            hintText.fontSizeMin = 7f * k;
+            hintText.fontSizeMax = 11f * k;
         }
 
         static RectTransform NewRect(string name, RectTransform parent, Vector2 anchor, Vector2 position, Vector2 size)

@@ -8,8 +8,11 @@ namespace SmartHouse
     /// <summary>
     /// Base class for every interactive device in the house. Makes the object selectable
     /// with XR controllers (ray or direct) and exposes a status line for the hub panel.
-    /// Devices that implement <see cref="IAdjustable"/> can also be dragged: hold the trigger and
-    /// move the controller up or down to change the value; a short press without moving still presses.
+    /// Devices that implement <see cref="IAdjustable"/> can also be adjusted while grabbed (grip): move the
+    /// controller up or down, or twist the wrist like a knob, to change the value; a color lamp (or a
+    /// switch that operates one) changes color when twisted instead. A short press without moving still presses.
+    /// A wall panel forwards its grab here (<see cref="BeginGrab"/>), so grabbing the panel works the same.
+    /// (The trigger does the same through <see cref="TriggerTwist"/>, which works without grabbing.)
     /// </summary>
     [RequireComponent(typeof(XRSimpleInteractable))]
     public abstract class SmartDevice : MonoBehaviour
@@ -28,6 +31,16 @@ namespace SmartHouse
 
         /// <summary>The device this one operates (a wall switch's lamp), or null. Its wall panel lights up on hover too.</summary>
         public virtual SmartDevice ControlledDevice => null;
+
+        /// <summary>The color lamp this device sets the color of when twisted while grabbed: itself or the lamp it operates; null if none.</summary>
+        public IColorDevice ColorTarget
+        {
+            get
+            {
+                if (this is IColorDevice self && self.SupportsColor) return self;
+                return ControlledDevice is IColorDevice lamp && lamp.SupportsColor ? lamp : null;
+            }
+        }
 
         public event System.Action<SmartDevice> StateChanged;
 
@@ -61,12 +74,16 @@ namespace SmartHouse
         bool dragged;
         float selectTime;
 
-        void OnSelected(SelectEnterEventArgs args)
+        void OnSelected(SelectEnterEventArgs args) => BeginGrab(args.interactorObject.transform);
+        void OnDeselected(SelectExitEventArgs args) => EndGrab(args.interactorObject.transform);
+
+        /// <summary>A controller grabbed the device (or its wall panel). Plain devices are pressed right away.</summary>
+        public void BeginGrab(Transform hand)
         {
-            if (this is IAdjustable)
+            if (this is IAdjustable || ColorTarget != null)
             {
-                // Decide on release: a press if the hand stayed still, otherwise it was a drag.
-                dragInteractor = args.interactorObject.transform;
+                // Decide on release: a press if the hand stayed still, otherwise it was a drag or twist.
+                dragInteractor = hand;
                 dragged = false;
                 selectTime = Time.unscaledTime;
                 StartCoroutine(Drag(dragInteractor));
@@ -75,9 +92,9 @@ namespace SmartHouse
             Press();
         }
 
-        void OnDeselected(SelectExitEventArgs args)
+        public void EndGrab(Transform hand)
         {
-            if (dragInteractor == null || args.interactorObject.transform != dragInteractor) return;
+            if (dragInteractor == null || hand != dragInteractor) return;
             dragInteractor = null;
             // In the desktop simulator one mouse click is both a DesktopPointer press and an XR select;
             // if the device was already pressed during this select, don't toggle it a second time.
@@ -88,15 +105,36 @@ namespace SmartHouse
         {
             float startY = hand.position.y;
             float lastY = startY;
+            Quaternion lastRotation = hand.rotation;
+            float twist = 0f;
+            bool twisting = false;
             while (dragInteractor == hand && hand != null)
             {
                 float y = hand.position.y;
-                if (!dragged && Mathf.Abs(y - startY) > DragDeadZone)
+                twist += WristTwist.Delta(lastRotation, hand.rotation);
+                lastRotation = hand.rotation;
+
+                // Whichever passes its dead zone first decides: twisting or moving up/down.
+                if (!dragged && Mathf.Abs(twist) > WristTwist.DeadZoneDegrees)
+                {
+                    dragged = twisting = true;
+                    twist = Mathf.Sign(twist) * (Mathf.Abs(twist) - WristTwist.DeadZoneDegrees);
+                }
+                else if (!dragged && this is IAdjustable && Mathf.Abs(y - startY) > DragDeadZone)
                 {
                     dragged = true;
                     lastY = startY + Mathf.Sign(y - startY) * DragDeadZone;
                 }
-                if (dragged && !Mathf.Approximately(y, lastY))
+
+                if (twisting && twist != 0f)
+                {
+                    float amount = twist / WristTwist.FullRangeDegrees;
+                    var colorLamp = ColorTarget;
+                    if (colorLamp != null) colorLamp.AdjustColor(amount);
+                    else ((IAdjustable)this).Adjust(amount);
+                    twist = 0f;
+                }
+                else if (dragged && !twisting && !Mathf.Approximately(y, lastY))
                 {
                     ((IAdjustable)this).Adjust((y - lastY) / DragFullRange);
                     lastY = y;

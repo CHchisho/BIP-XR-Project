@@ -1,5 +1,7 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
 using NUnit.Framework;
 using SmartHouse.HomeAssistant;
 using UnityEngine;
@@ -10,7 +12,8 @@ namespace SmartHouse.Tests
 {
     /// <summary>
     /// Read-only checks against the REAL lab Home Assistant: the API answers, the token is accepted,
-    /// and every approved device from ha-api-v2.md exists. Never sends a command.
+    /// every approved device from ha-api-v2.md and the speaker from ha-api-speaker.md exist, and the
+    /// speaker's station list can be browsed. Never sends a command.
     /// Skipped (Ignored) when there is no token or the lab LAN can't be reached.
     /// Run only these with the test filter category "LiveHomeAssistant".
     /// </summary>
@@ -31,6 +34,7 @@ namespace SmartHouse.Tests
             "lock.z_wave_controlled_door_lock_with_bluetooth_smart",
             "climate.thermostat",
             "sensor.aqara_dimmer_switch_h2_power",
+            "media_player.famnest2", // ha-api-speaker.md
         };
 
         string baseUrl;
@@ -84,6 +88,35 @@ namespace SmartHouse.Tests
                 if (state.state == "unavailable")
                     Debug.LogWarning($"[LiveHomeAssistant] {entityId} exists but is unavailable (device not responding).");
             });
+        }
+
+        [UnityTest]
+        public IEnumerator Speaker_PopularStations_CanBeBrowsed()
+        {
+            yield return Get("api/", _ => { }); // skips the test when Home Assistant can't be reached
+
+            var go = new GameObject("Home Assistant Client (live test)");
+            go.SetActive(false);
+            var client = go.AddComponent<HomeAssistantClient>();
+            client.Configure(baseUrl, token);
+            go.SetActive(true);
+            try
+            {
+                List<HomeAssistantClient.MediaItem> items = null;
+                bool done = false;
+                yield return client.BrowseMedia("media_player.famnest2", "media-source://radio_browser/popular", r => { items = r; done = true; });
+                Assert.IsTrue(done);
+                Assert.IsNotNull(items, "browse_media failed; see the warning in the log");
+                var playable = items.Where(i => i.can_play).ToList();
+                Assert.IsNotEmpty(playable, "no playable station in Radio Browser → Popular");
+                foreach (var station in playable)
+                {
+                    StringAssert.StartsWith("media-source://radio_browser/", station.media_content_id);
+                    StringAssert.StartsWith("audio/", station.media_content_type);
+                }
+                Debug.Log("[LiveHomeAssistant] Popular stations: " + string.Join(", ", playable.Select(p => p.title)));
+            }
+            finally { UnityEngine.Object.DestroyImmediate(go); }
         }
     }
 }

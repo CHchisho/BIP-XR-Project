@@ -5,7 +5,8 @@ namespace SmartHouse
 {
     /// <summary>
     /// Lets you use the devices with the mouse when no headset is running:
-    /// left-click a device in the Game view to press it, scroll over a dimmer, lamp or thermostat to adjust it.
+    /// left-click a device in the Game view to press it, scroll over a dimmer, lamp or thermostat to adjust it,
+    /// shift-scroll over a color lamp to change its color.
     /// A label shows which device is under the cursor.
     /// </summary>
     public class DesktopPointer : MonoBehaviour
@@ -13,6 +14,8 @@ namespace SmartHouse
         [SerializeField] float maxDistance = 30f;
         [Tooltip("Change per scroll-wheel notch, as a fraction of the device's full range.")]
         [SerializeField] float scrollStep = 0.05f;
+
+        const float ColorScrollStep = 1f / 24f;
 
         bool active;
         SmartDevice hovered;
@@ -51,7 +54,11 @@ namespace SmartHouse
                 hovered.Press();
 
             float scroll = Mouse.current.scroll.ReadValue().y;
-            if (scroll != 0f && hovered is IAdjustable adjustable)
+            if (scroll == 0f) return;
+            bool shift = Keyboard.current != null && Keyboard.current.shiftKey.isPressed;
+            if (shift && hovered.ColorTarget != null)
+                hovered.ColorTarget.AdjustColor(Mathf.Sign(scroll) * ColorScrollStep);
+            else if (hovered is IAdjustable adjustable)
                 adjustable.Adjust(Mathf.Sign(scroll) * scrollStep);
         }
 
@@ -69,6 +76,7 @@ namespace SmartHouse
             {
                 var mouse = Mouse.current.position.ReadValue();
                 var hint = hovered is IAdjustable ? "click · scroll" : "click";
+                if (hovered.ColorTarget != null) hint += " · shift-scroll: color";
                 var text = $"{hovered.DisplayName}: {hovered.Status}  ({hint})";
                 GUI.Box(new Rect(mouse.x + 18f, Screen.height - mouse.y + 6f, 420f, 28f), text, labelStyle);
             }
