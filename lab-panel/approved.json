@@ -1,0 +1,13 @@
+{
+  "switch.aqara_lumi_plug_aeu001_switch_2": "Plug. State change confirmed.",
+  "switch.metered_wall_plug_switch": "Wall plug. State change confirmed.",
+  "sensor.aqara_dimmer_switch_h2_power": "Dimmer knob. Power (W) changed when turned. Read only.",
+  "light.rgbw_controller_2": "Checked from the panel.",
+  "lock.aqara_smart_lock_u200_lite": "Checked from the panel.",
+  "lock.z_wave_controlled_door_lock_with_bluetooth_smart": "Checked from the panel.",
+  "light.aqara_dimmer_switch_h2_2": "Checked from the panel.",
+  "cover.aqara_curtain_driver_e1": "Checked from the panel.",
+  "cover.aqara_roller_shade_driver_e1": "Checked from the panel.",
+  "climate.thermostat": "Kitchen thermostat. Mode and target temperature checked on the device.",
+  "light.switch": "Checked from the panel."
+}

@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KNX lab</title>
+  <script src="/hls.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #12140f;
+      --card: #1c2118;
+      --line: #31382b;
+      --text: #e7ecdf;
+      --muted: #9aa392;
+      --on: #d6f25c;
+      --on-ink: #1a2208;
+      --off: #2a3126;
+      --danger: #ffb4a8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 16px/1.4 "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main { max-width: 980px; margin: 0 auto; padding: 28px 18px 64px; }
+    h1 { font-size: 28px; margin: 0 0 6px; }
+    h2 { font-size: 18px; margin: 28px 0 12px; }
+    p.lead { margin: 0 0 18px; color: var(--muted); }
+    form, .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+    form { display: grid; gap: 10px; padding: 14px; }
+    label, .field { display: grid; gap: 4px; color: var(--muted); font-size: 13px; }
+    input, select {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #10140e;
+      color: var(--text);
+    }
+    input[type="range"] { padding: 0; accent-color: var(--on); }
+    input[type="color"] { height: 44px; padding: 4px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      background: var(--on);
+      color: var(--on-ink);
+      font-weight: 650;
+      cursor: pointer;
+    }
+    button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    button:disabled { opacity: 0.45; cursor: default; }
+    .status { min-height: 1.4em; margin: 10px 0 0; color: var(--muted); }
+    .status.error { color: var(--danger); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+    .card { padding: 14px; display: grid; gap: 8px; align-content: start; }
+    .preview { width: 100%; border-radius: 8px; background: #000; min-height: 140px; object-fit: cover; display: block; }
+    .name { font-weight: 650; }
+    .id, .detail { color: var(--muted); font-size: 12px; word-break: break-all; }
+    .pill {
+      justify-self: start;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--off);
+      font-size: 13px;
+    }
+    .pill.on { background: var(--on); color: var(--on-ink); }
+    .badge {
+      justify-self: start;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--on);
+    }
+    .note { color: var(--muted); font-size: 13px; }
+    .sensors { display: grid; gap: 6px; }
+    .sensor {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    #filter { margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Lab panel</h1>
+    <p class="lead">This page only talks to this computer. Commands are the same service calls Home Assistant uses on its own screen. Sirens and alarm panels are not listed.</p>
+
+    <form id="login">
+      <label>Home Assistant address
+        <input name="base_url" value="http://homeassistant.local:8123">
+      </label>
+      <label>Username
+        <input name="username" autocomplete="username" value="bip_erasmus">
+      </label>
+      <label>Home Assistant password, not the Wi‑Fi password
+        <input name="password" type="password" autocomplete="current-password">
+      </label>
+      <label>Or a long-lived token
+        <input name="token" type="password" autocomplete="off">
+      </label>
+      <div class="row">
+        <button type="submit">Log in</button>
+        <button type="button" class="ghost" id="refresh" disabled>Refresh</button>
+        <button type="button" class="ghost" id="logout" disabled>Log out</button>
+      </div>
+    </form>
+    <p class="status" id="status"></p>
+
+    <section id="devices" hidden>
+      <input id="filter" placeholder="Filter by name or entity id" autocomplete="off">
+      <h2>Approved</h2>
+      <div class="grid" id="verified"></div>
+      <div id="groups"></div>
+    </section>
+  </main>
+  <script>
+    const statusEl = document.querySelector("#status");
+    const form = document.querySelector("#login");
+    const refreshBtn = document.querySelector("#refresh");
+    const logoutBtn = document.querySelector("#logout");
+    const filterEl = document.querySelector("#filter");
+    const activeStates = new Set(["on", "unlocked", "open", "opening", "heat", "cool", "heat_cool", "playing", "home", "cleaning"]);
+    const verifiedOrder = [
+      "light.aqara_dimmer_switch_h2",
+      "switch.aqara_lumi_plug_aeu001_switch_2",
+      "switch.metered_wall_plug_switch",
+      "sensor.aqara_dimmer_switch_h2_power",
+    ];
+    let timer = 0;
+    let lastData = null;
+    let savedCameras = new Map();
+    const radioStations = new Map();
+    const radioChoice = new Map();
+
+    function setStatus(text, isError) {
+      statusEl.textContent = text || "";
+      statusEl.classList.toggle("error", Boolean(isError));
+    }
+
+    async function api(path, options) {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const detail = data.detail;
+        throw new Error(typeof detail === "string" ? detail : "Request failed");
+      }
+      return data;
+    }
+
+    function actionButton(label, className, onClick, disabled) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      if (className) button.className = className;
+      button.disabled = Boolean(disabled);
+      button.addEventListener("click", () => onClick(button));
+      return button;
+    }
+
+    function matches(item) {
+      const query = filterEl.value.trim().toLowerCase();
+      if (!query) return true;
+      return item.name.toLowerCase().includes(query) || item.entity_id.toLowerCase().includes(query);
+    }
+
+    function typing() {
+      const el = document.activeElement;
+      return Boolean(el && el.closest && el.closest("#devices") && (el.tagName === "INPUT" || el.tagName === "SELECT") && el.id !== "filter");
+    }
+
+    function approveButton(item) {
+      if (item.verified) {
+        return actionButton("Remove approval", "ghost", (button) => command("/api/unapprove", { entity_id: item.entity_id }, button));
+      }
+      return actionButton("Approve", "ghost", (button) => command("/api/approve", { entity_id: item.entity_id, note: "Checked from the panel." }, button));
+    }
+
+    function controlNode(item, control, dead) {
+      if (control.type === "button") {
+        const primary = ["Turn on", "Lock", "Open", "Unlock", "Activate", "Press", "Start", "Run"].includes(control.label);
+        return actionButton(
+          control.label,
+          primary ? "" : "ghost",
+          (button) => command("/api/call", { entity_id: item.entity_id, service: control.service, data: {} }, button),
+          dead,
+        );
+      }
+      if (control.type === "color") {
+        const field = document.createElement("label");
+        field.className = "field";
+        field.append(document.createTextNode(control.label));
+        const color = document.createElement("input");
+        color.type = "color";
+        color.value = control.value || "#ffffff";
+        color.disabled = dead;
+        field.append(color);
+        let white = null;
+        if (control.white !== null && control.white !== undefined) {
+          const caption = document.createElement("span");
+          caption.textContent = "White";
+          white = document.createElement("input");
+          white.type = "range";
+          white.min = "0";
+          white.max = "255";
+          white.step = "1";
+          white.value = control.white;
+          white.disabled = dead;
+          field.append(caption, white);
+        }
+        field.append(actionButton("Set color", "ghost", (button) => {
+          const hex = color.value.replace("#", "");
+          const data = {
+            rgb: [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)],
+          };
+          if (white) data.white = Number(white.value);
+          return command("/api/call", { entity_id: item.entity_id, service: control.service, data }, button);
+        }, dead));
+        return field;
+      }
+      const field = document.createElement("label");
+      field.className = "field";
+      field.textContent = control.label;
+      if (control.type === "range") {
+        const input = document.createElement("input");
+        input.type = "range";
+        input.min = control.min;
+        input.max = control.max;
+        input.step = control.step;
+        input.value = control.value;
+        input.disabled = dead;
+        const apply = actionButton("Set", "ghost", (button) => {
+          const data = {};
+          data[control.param] = Number(input.value);
+          return command("/api/call", { entity_id: item.entity_id, service: control.service, data }, button);
+        }, dead);
+        field.append(input, apply);
+        return field;
+      }
+      const select = document.createElement("select");
+      for (const option of control.options) {
+        const node = document.createElement("option");
+        node.value = option;
+        node.textContent = option;
+        node.selected = option === control.value;
+        select.append(node);
+      }
+      select.disabled = dead;
+      const apply = actionButton("Set", "ghost", (button) => {
+        const data = {};
+        data[control.param] = select.value;
+        return command("/api/call", { entity_id: item.entity_id, service: control.service, data }, button);
+      }, dead);
+      field.append(select, apply);
+      return field;
+    }
+
+    function radioField(item, dead) {
+      const field = document.createElement("label");
+      field.className = "field";
+      field.textContent = "Radio";
+      const filter = document.createElement("input");
+      filter.placeholder = "Filter stations";
+      filter.disabled = dead;
+      const select = document.createElement("select");
+      select.disabled = dead;
+      field.append(filter, select);
+      const fill = (stations) => {
+        const query = filter.value.trim().toLowerCase();
+        const shown = stations.filter((station) => station.title.toLowerCase().includes(query));
+        const previous = radioChoice.get(item.entity_id) || select.value;
+        select.replaceChildren();
+        for (const station of shown) {
+          const option = document.createElement("option");
+          option.value = station.media_content_id;
+          option.textContent = station.title;
+          option.selected = station.media_content_id === previous;
+          select.append(option);
+        }
+        if (!shown.length) {
+          const empty = document.createElement("option");
+          empty.textContent = query ? "No match" : "No stations";
+          select.append(empty);
+        }
+      };
+      filter.addEventListener("input", () => fill(radioStations.get(item.entity_id) || []));
+      select.addEventListener("change", () => radioChoice.set(item.entity_id, select.value));
+      field.append(actionButton("Play", "", (button) => {
+        const station = (radioStations.get(item.entity_id) || []).find((itemStation) => itemStation.media_content_id === select.value);
+        if (!station) return;
+        radioChoice.set(item.entity_id, station.media_content_id);
+        return command("/api/call", {
+          entity_id: item.entity_id,
+          service: "play_media",
+          data: {
+            media_content_id: station.media_content_id,
+            media_content_type: station.media_content_type,
+          },
+        }, button);
+      }, dead));
+      const cached = radioStations.get(item.entity_id);
+      if (cached) fill(cached);
+      else {
+        const waiting = document.createElement("option");
+        waiting.textContent = "Loading stations…";
+        select.append(waiting);
+        api(`/api/radio/${encodeURIComponent(item.entity_id)}`).then((data) => {
+          const stations = data.stations || [];
+          radioStations.set(item.entity_id, stations);
+          if (field.isConnected) fill(stations);
+        }).catch((error) => {
+          if (!field.isConnected) return;
+          waiting.textContent = error.message;
+        });
+      }
+      return field;
+    }
+
+    function mountPreview(holder, node) {
+      holder.replaceWith(node);
+    }
+
+    async function startHls(holder, url) {
+      const video = document.createElement("video");
+      video.className = "preview";
+      video.autoplay = true;
+      video.muted = true;
+      video.playsInline = true;
+      video.controls = true;
+      mountPreview(holder, video);
+      if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = url;
+        return;
+      }
+      if (!window.Hls || !Hls.isSupported()) {
+        holder.textContent = "This browser cannot play the camera stream.";
+        return;
+      }
+      const player = new Hls({ manifestLoadingMaxRetry: 6, levelLoadingMaxRetry: 8 });
+      player.loadSource(url);
+      player.attachMedia(video);
+      player.on(Hls.Events.ERROR, (_, data) => {
+        if (!data.fatal) return;
+        player.destroy();
+        const note = document.createElement("div");
+        note.className = "detail";
+        note.textContent = "Camera stream failed.";
+        video.replaceWith(note);
+      });
+    }
+
+    async function startWebRtc(holder, entityId) {
+      const client = await api("/api/camera/webrtc/config", {
+        method: "POST",
+        body: JSON.stringify({ entity_id: entityId }),
+      });
+      const pc = new RTCPeerConnection(client.configuration || {});
+      const video = document.createElement("video");
+      video.className = "preview";
+      video.autoplay = true;
+      video.muted = true;
+      video.playsInline = true;
+      video.controls = true;
+      pc.addTransceiver("video", { direction: "recvonly" });
+      pc.addTransceiver("audio", { direction: "recvonly" });
+      pc.ontrack = (event) => {
+        video.srcObject = event.streams[0];
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await new Promise((resolve) => {
+        if (pc.iceGatheringState === "complete") {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, 1500);
+        pc.addEventListener("icegatheringstatechange", () => {
+          if (pc.iceGatheringState === "complete") {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+      });
+      const queued = [];
+      let sessionId = "";
+      const sendCandidate = (candidate) => api("/api/camera/webrtc/candidate", {
+        method: "POST",
+        body: JSON.stringify({ entity_id: entityId, session_id: sessionId, candidate: candidate.toJSON() }),
+      }).catch(() => {});
+      pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        if (!sessionId) queued.push(event.candidate);
+        else sendCandidate(event.candidate);
+      };
+      const result = await api("/api/camera/webrtc/offer", {
+        method: "POST",
+        body: JSON.stringify({ entity_id: entityId, offer: pc.localDescription.sdp }),
+      });
+      sessionId = result.session_id;
+      queued.forEach(sendCandidate);
+      await pc.setRemoteDescription({ type: "answer", sdp: result.answer });
+      for (const candidate of result.candidates || []) {
+        if (candidate && candidate.candidate) await pc.addIceCandidate(candidate);
+      }
+      mountPreview(holder, video);
+      let cursor = (result.candidates || []).length;
+      const timer = setInterval(async () => {
+        const data = await api(`/api/camera/webrtc/candidates?session_id=${encodeURIComponent(sessionId)}&after=${cursor}`).catch(() => null);
+        if (!data) return;
+        for (const candidate of data.candidates || []) {
+          if (candidate && candidate.candidate) await pc.addIceCandidate(candidate).catch(() => {});
+        }
+        cursor = data.next;
+      }, 500);
+      video.addEventListener("emptied", () => clearInterval(timer));
+    }
+
+    async function startCamera(node, entityId, holder) {
+      try {
+        holder.textContent = "Opening the live stream…";
+        await startHls(holder, `/api/camera/${entityId}/playlist.m3u8`);
+      } catch (error) {
+        holder.textContent = error.message;
+        if (!holder.isConnected) node.querySelector(".id").after(holder);
+      }
+    }
+
+    function card(item) {
+      const node = document.createElement("article");
+      node.className = "card";
+      const dead = item.state === "unavailable" || item.state === "unknown";
+      node.innerHTML = `<div class="name"></div><div class="id"></div><div class="pill"></div>`;
+      node.querySelector(".name").textContent = item.name;
+      node.querySelector(".id").textContent = item.entity_id;
+      if (item.verified) {
+        const badge = document.createElement("div");
+        badge.className = "badge";
+        badge.textContent = "Approved";
+        node.querySelector(".name").before(badge);
+        if (item.note) {
+          const note = document.createElement("div");
+          note.className = "note";
+          note.textContent = item.note;
+          node.querySelector(".id").after(note);
+        }
+      }
+      if (item.domain === "camera") {
+        const prev = savedCameras.get(item.entity_id);
+        if (prev) {
+          savedCameras.delete(item.entity_id);
+          const pill = prev.querySelector(".pill");
+          if (pill) pill.textContent = item.state;
+          return prev;
+        }
+        node.dataset.camera = item.entity_id;
+        const preview = document.createElement("div");
+        preview.className = "detail";
+        preview.textContent = "Opening the live stream…";
+        node.querySelector(".id").after(preview);
+        startCamera(node, item.entity_id, preview);
+      }
+      if (item.detail) {
+        const detail = document.createElement("div");
+        detail.className = "detail";
+        detail.textContent = item.detail;
+        node.querySelector(".pill").before(detail);
+      }
+      const pill = node.querySelector(".pill");
+      const shown = item.unit && item.domain === "sensor" ? `${item.state} ${item.unit}` : item.state;
+      pill.textContent = shown;
+      pill.classList.toggle("on", activeStates.has(item.state));
+      const row = document.createElement("div");
+      row.className = "row";
+      for (const control of item.controls) {
+        const controlEl = controlNode(item, control, dead);
+        if (control.type === "button") row.append(controlEl);
+        else node.append(controlEl);
+      }
+      if (item.radio) node.append(radioField(item, dead));
+      row.append(approveButton(item));
+      node.append(row);
+      return node;
+    }
+
+    function sensorRow(item) {
+      const row = document.createElement("div");
+      row.className = "sensor";
+      const name = document.createElement("div");
+      name.textContent = item.verified ? `${item.name} · approved` : item.name;
+      const value = document.createElement("div");
+      value.textContent = item.unit ? `${item.state} ${item.unit}` : item.state;
+      row.append(name, value, approveButton(item));
+      return row;
+    }
+
+    function rank(id) {
+      const index = verifiedOrder.indexOf(id);
+      return index === -1 ? verifiedOrder.length : index;
+    }
+
+    function render(data) {
+      lastData = data;
+      savedCameras = new Map();
+      document.querySelectorAll("article[data-camera]").forEach((node) => {
+        savedCameras.set(node.dataset.camera, node);
+        node.remove();
+      });
+      const approved = data.groups
+        .flatMap((group) => group.items)
+        .filter((item) => item.verified && matches(item))
+        .sort((a, b) => rank(a.entity_id) - rank(b.entity_id));
+      document.querySelector("#verified").replaceChildren(...approved.map(card));
+      const groups = document.querySelector("#groups");
+      groups.replaceChildren();
+      let shown = 0;
+      for (const group of data.groups) {
+        const items = group.items.filter(matches);
+        if (!items.length) continue;
+        shown += items.length;
+        const title = document.createElement("h2");
+        title.textContent = `${group.title} (${items.length})`;
+        const box = document.createElement("div");
+        box.className = group.compact ? "sensors" : "grid";
+        box.append(...items.map((item) => (group.compact ? sensorRow(item) : card(item))));
+        groups.append(title, box);
+      }
+      document.querySelector("#devices").hidden = false;
+      const total = data.groups.reduce((sum, group) => sum + group.items.length, 0);
+      setStatus(filterEl.value.trim() ? `${shown} shown` : `${total} devices`);
+    }
+
+    async function loadDevices() {
+      if (typing()) return;
+      render(await api("/api/devices"));
+    }
+
+    async function command(path, body, button) {
+      if (button) button.disabled = true;
+      try {
+        await api(path, { method: "POST", body: JSON.stringify(body) });
+        await loadDevices();
+      } catch (error) {
+        setStatus(error.message, true);
+        if (button) button.disabled = false;
+      }
+    }
+
+    function setLoggedIn(on) {
+      refreshBtn.disabled = !on;
+      logoutBtn.disabled = !on;
+      clearInterval(timer);
+      if (on) timer = setInterval(() => loadDevices().catch((error) => setStatus(error.message, true)), 4000);
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(form));
+      setStatus("Signing in…");
+      try {
+        await api("/api/login", { method: "POST", body: JSON.stringify(data) });
+        form.password.value = "";
+        form.token.value = "";
+        setLoggedIn(true);
+        await loadDevices();
+      } catch (error) {
+        const session = await api("/api/session").catch(() => ({ logged_in: false }));
+        if (session.logged_in) {
+          setLoggedIn(true);
+          setStatus(error.message + " The current connection is still open, so the devices below can still be used.", true);
+          return;
+        }
+        setLoggedIn(false);
+        setStatus(error.message, true);
+      }
+    });
+
+    filterEl.addEventListener("input", () => {
+      if (lastData) render(lastData);
+    });
+    refreshBtn.addEventListener("click", () => loadDevices().catch((error) => setStatus(error.message, true)));
+    logoutBtn.addEventListener("click", async () => {
+      await api("/api/logout", { method: "POST", body: "{}" });
+      setLoggedIn(false);
+      document.querySelector("#devices").hidden = true;
+      setStatus("Signed out");
+    });
+
+    api("/api/session").then(async (data) => {
+      if (!data.logged_in) return;
+      setLoggedIn(true);
+      await loadDevices();
+    }).catch(() => {});
+  </script>
+</body>
+</html>
